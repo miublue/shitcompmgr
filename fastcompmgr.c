@@ -50,17 +50,6 @@ typedef struct _conv {
   double *data;
 } conv;
 
-typedef struct _fade {
-  struct _fade *next;
-  win *w;
-  double cur;
-  double finish;
-  double step;
-  void (*callback) (Display *dpy, win *w);
-  Display *dpy;
-} fade;
-
-fade *fades;
 Display *dpy;
 Picture black_picture;
 Picture cshadow_picture;
@@ -83,7 +72,6 @@ static Bool g_paint_ignore_region_is_dirty = True;
 Atom win_type[NUM_WINTYPES];
 double win_type_opacity[NUM_WINTYPES];
 Bool win_type_shadow[NUM_WINTYPES];
-Bool win_type_fade[NUM_WINTYPES];
 
 #define REGISTER_PROP "_NET_WM_CM_S"
 
@@ -110,8 +98,6 @@ determine_mode(Display *dpy, win *w);
 static bool
 is_gtk_frame_extent(Display *dpy, Window w);
 
-static double
-get_opacity_percent(Display *dpy, win *w);
 static void
 do_configure_win(Display *dpy, win* w);
 static void
@@ -124,12 +110,6 @@ int shadow_radius = 12;
 int shadow_offset_x = -15;
 int shadow_offset_y = -15;
 double shadow_opacity = .75;
-
-double fade_in_step = 0.028;
-double fade_out_step = 0.03;
-int fade_delta = 10;
-int fade_time = 0;
-Bool fade_trans = False;
 
 double inactive_opacity = 0;
 double frame_opacity = 0;
@@ -147,185 +127,6 @@ double frame_opacity = 0;
 int Gsize = -1;
 unsigned char *shadow_corner = NULL;
 unsigned char *shadow_top = NULL;
-
-
-fade *
-find_fade(win *w) {
-  fade *f;
-
-  for (f = fades; f; f = f->next) {
-    if (f->w == w) return f;
-  }
-
-  return 0;
-}
-
-void
-dequeue_fade(Display *dpy, fade *f) {
-  fade **prev;
-
-  for (prev = &fades; *prev; prev = &(*prev)->next) {
-    if (*prev == f) {
-      *prev = f->next;
-      if (f->callback) {
-        (*f->callback)(dpy, f->w);
-      }
-      free(f);
-      break;
-    }
-  }
-}
-
-void
-cleanup_fade(Display *dpy, win *w) {
-  fade *f = find_fade (w);
-  if (f) {
-    dequeue_fade(dpy, f);
-  }
-}
-
-void
-enqueue_fade(Display *dpy, fade *f) {
-  if (!fades) {
-    fade_time = get_time_in_milliseconds() + fade_delta;
-  }
-  f->next = fades;
-  fades = f;
-}
-
-static void
-set_fade(Display *dpy, win *w, double start,
-         double finish, double step,
-         void(*callback) (Display *dpy, win *w),
-         Bool exec_callback, Bool override) {
-  fade *f;
-
-  f = find_fade(w);
-  if (!f) {
-    f = malloc(sizeof(fade));
-    f->next = 0;
-    f->w = w;
-    f->cur = start;
-    enqueue_fade(dpy, f);
-  } else if (!override) {
-    return;
-  } else {
-    if (exec_callback && f->callback) {
-      (*f->callback)(dpy, f->w);
-    }
-  }
-
-  if (finish < 0) finish = 0;
-  if (finish > 1) finish = 1;
-  f->finish = finish;
-
-  if (f->cur < finish) {
-    f->step = step;
-  } else if (f->cur > finish) {
-    f->step = -step;
-  }
-
-  f->callback = callback;
-  w->opacity = f->cur * OPAQUE;
-
-#if 0
-  printf("set_fade start %g step %g\n", f->cur, f->step);
-#endif
-
-  determine_mode(dpy, w);
-
-  if (w->shadow) {
-    // rebuild the shadow
-    XRenderFreePicture(dpy, w->shadow);
-    w->shadow = None;
-    win_extents(dpy, w);
-  }
-
-  /* fading windows need to be drawn, mark
-     them as damaged.  when a window maps,
-     if it tries to fade in but it already
-     at the right opacity (map/unmap/map fast)
-     then it will never get drawn without this
-     until it repaints */
-  w->damaged = 1;
-}
-
-int
-fade_timeout(void) {
-  int now;
-  int delta;
-
-  if (!fades) return -1;
-
-  now = get_time_in_milliseconds();
-  delta = fade_time - now;
-
-  if (delta < 0) delta = 0;
-/* printf("timeout %d\n", delta); */
-
-  return delta;
-}
-
-void
-run_fades(Display *dpy) {
-  int now = get_time_in_milliseconds();
-  fade *next = fades;
-  int steps;
-  Bool need_dequeue;
-
-#if 0
-  printf("run fades\n");
-#endif
-
-  if (fade_time - now > 0) return;
-  steps = 1 + (now - fade_time) / fade_delta;
-
-  while (next) {
-    fade *f = next;
-    win *w = f->w;
-    next = f->next;
-
-    f->cur += f->step * steps;
-    if (f->cur >= 1) {
-      f->cur = 1;
-    } else if (f->cur < 0) {
-      f->cur = 0;
-    }
-
-#if 0
-    printf("opacity now %g\n", f->cur);
-#endif
-
-    w->opacity = f->cur * OPAQUE;
-    need_dequeue = False;
-    if (f->step > 0) {
-      if (f->cur >= f->finish) {
-        w->opacity = f->finish * OPAQUE;
-        need_dequeue = True;
-      }
-    } else {
-      if (f->cur <= f->finish) {
-        w->opacity = f->finish * OPAQUE;
-        need_dequeue = True;
-      }
-    }
-
-    determine_mode(dpy, w);
-
-    if (w->shadow) {
-      // rebuild the shadow
-      XRenderFreePicture(dpy, w->shadow);
-      w->shadow = None;
-      win_extents(dpy, w);
-    }
-
-    /* Must do this last as it might
-       destroy f->w in callbacks */
-    if (need_dequeue) dequeue_fade(dpy, f);
-  }
-
-  fade_time = now + fade_delta;
-}
 
 static double
 gaussian(double r, double x, double y) {
@@ -1423,7 +1224,7 @@ handle_ConfigureNotify(Display *dpy, XConfigureEvent *ce);
 
 static void
 map_win(Display *dpy, Window id,
-        unsigned long sequence, Bool fade) {
+        unsigned long sequence) {
   win *w = find_win(id);
 
   if (unlikely(!w)) return;
@@ -1455,12 +1256,6 @@ map_win(Display *dpy, Window id,
 #endif
   w->damaged = 0;
   w->paint_needed = True;
-
-  if (fade && win_type_fade[w->window_type]) {
-    set_fade(
-      dpy, w, 0, get_opacity_percent(dpy, w),
-      fade_in_step, 0, True, True);
-  }
 
   set_paint_ignore_region_dirty();
 
@@ -1510,34 +1305,20 @@ finish_unmap_win(Display *dpy, win *w) {
   clip_changed = True;
 }
 
-#if HAS_NAME_WINDOW_PIXMAP
 static void
-unmap_callback(Display *dpy, win *w) {
-  finish_unmap_win(dpy, w);
-}
-#endif
-
-static void
-unmap_win(Display *dpy, Window id, Bool fade) {
+unmap_win(Display *dpy, Window id) {
   win *w = find_win(id);
 
   if (!w) return;
 
-    /* don't care about properties anymore */
+  /* don't care about properties anymore */
   set_ignore(dpy, NextRequest(dpy));
   XSelectInput(dpy, w->id, 0);
 
   w->a.map_state = IsUnmapped;
   set_paint_ignore_region_dirty();
 
-
-#if HAS_NAME_WINDOW_PIXMAP
-  if (w->pixmap && fade && win_type_fade[w->window_type]) {
-    set_fade(dpy, w, w->opacity * 1.0 / OPAQUE, 0.0,
-             fade_out_step, unmap_callback, False, True);
-  } else
-#endif
-    finish_unmap_win(dpy, w);
+  finish_unmap_win(dpy, w);
 }
 
 static bool is_gtk_frame_extent(Display *dpy, Window w){
@@ -1579,21 +1360,6 @@ get_opacity_prop(Display *dpy, win *w, unsigned int def) {
   }
 
   return def;
-}
-
-/*
- * Get the opacity property from the window in a percent format
- * not found: default
- * otherwise: the value
-*/
-
-static double
-get_opacity_percent(Display *dpy, win *w) {
-  double def = win_type_opacity[w->window_type];
-  unsigned int opacity =
-    get_opacity_prop(dpy, w, (unsigned int)(OPAQUE * def));
-
-  return opacity * 1.0 / OPAQUE;
 }
 
 static void
@@ -1642,21 +1408,13 @@ determine_mode(Display *dpy, win *w) {
 
 static void
 set_opacity(Display *dpy, win *w, unsigned long opacity) {
-  if (fade_trans) {
-    double old_opacity = (double)w->opacity / OPAQUE;
-    w->opacity = opacity;
-    set_fade(dpy, w, old_opacity,
-      (double)w->opacity / OPAQUE,
-      fade_out_step, 0, True, False);
-  } else {
-    w->opacity = opacity;
-    determine_mode(dpy, w);
-    if (w->shadow) {
-      // rebuild the shadow
-      XRenderFreePicture(dpy, w->shadow);
-      w->shadow = None;
-      win_extents(dpy, w);
-    }
+  w->opacity = opacity;
+  determine_mode(dpy, w);
+  if (w->shadow) {
+    // rebuild the shadow
+    XRenderFreePicture(dpy, w->shadow);
+    w->shadow = None;
+    win_extents(dpy, w);
   }
   set_paint_ignore_region_dirty();
 }
@@ -1748,7 +1506,7 @@ add_win(Display *dpy, Window id, Window prev) {
   if (new->a.map_state == IsViewable) {
     new->window_type = determine_wintype(dpy, id, id);
     new->opacity = win_suggest_opacity(new, &new->userdefined_opacity);
-    map_win(dpy, id, new->damage_sequence - 1, True);
+    map_win(dpy, id, new->damage_sequence - 1);
   }
 }
 
@@ -1921,8 +1679,6 @@ finish_destroy_win(Display *dpy, Window id) {
         w->damage = None;
       }
 
-      cleanup_fade(dpy, w);
-
       if (w->border_clip) {
         XFixesDestroyRegion(dpy, w->border_clip);
         w->border_clip = None;
@@ -1937,31 +1693,14 @@ finish_destroy_win(Display *dpy, Window id) {
   }
 }
 
-#if HAS_NAME_WINDOW_PIXMAP
 static void
-destroy_callback(Display *dpy, win *w) {
-  finish_destroy_win(dpy, w->id);
-}
-#endif
-
-static void
-destroy_win(Display *dpy, Window id, Bool fade) {
+destroy_win(Display *dpy, Window id) {
   win *w = find_win(id);
 
   if (w) w->destroyed = True;
 
   set_paint_ignore_region_dirty();
-
-#if HAS_NAME_WINDOW_PIXMAP
-  if (w && w->pixmap && fade && win_type_fade[w->window_type]) {
-    set_fade(dpy, w, w->opacity * 1.0 / OPAQUE,
-      0.0, fade_out_step, destroy_callback,
-      False, True);
-  } else
-#endif
-  {
-    finish_destroy_win(dpy, id);
-  }
+  finish_destroy_win(dpy, id);
 }
 
 #if 0
@@ -2032,10 +1771,6 @@ damage_win(Display *dpy, XDamageNotifyEvent *de) {
         && w->a.width <= w->damage_bounds.x + w->damage_bounds.width
         && w->a.height <= w->damage_bounds.y + w->damage_bounds.height) {
       clip_changed = True;
-      if (win_type_fade[w->window_type]) {
-        set_fade(dpy, w, 0, get_opacity_percent(dpy, w),
-                 fade_in_step, 0, True, True);
-      }
       w->usable = True;
     }
   }
@@ -2197,22 +1932,12 @@ usage(char *program, int exitcode) {
     The left offset for shadows. (default -15)
     -t top-offset
     The top offset for shadows. (default -15)
-    -I fade-in-step
-    Opacity change between steps while fading in. (default 0.028)
-    -O fade-out-step
-    Opacity change between steps while fading out. (default 0.03)
-    -D fade-delta-time
-    The time between steps in a fade in milliseconds. (default 10)
     -m opacity
     The opacity for menus. (default 1.0)
     -c
     Enabled client-side shadows on windows.
     -C
     Avoid drawing shadows on dock/panel windows.
-    -f
-    Fade windows in/out when opening/closing.
-    -F
-    Fade windows during opacity changes.
     -i opacity
     Opacity of inactive windows. (0.1 - 1.0)
     -e opacity
@@ -2350,7 +2075,6 @@ main(int argc, char **argv) {
   XRectangle *expose_rects = 0;
   int size_expose = 0;
   int n_expose = 0;
-  struct pollfd ufd;
   int p;
   int composite_major, composite_minor;
   double shadow_red = 0.0;
@@ -2365,12 +2089,11 @@ main(int argc, char **argv) {
   }
 
   for (i = 0; i < NUM_WINTYPES; ++i) {
-    win_type_fade[i] = False;
     win_type_shadow[i] = False;
     win_type_opacity[i] = 1.0;
   }
 
-  while ((o = getopt_long(argc, argv, "D:I:O:d:r:o:m:l:t:i:e:schnfFCaS",
+  while ((o = getopt_long(argc, argv, "d:r:o:m:l:t:i:e:schnCaS",
                           longopt, &longopt_idx)) != -1) {
     switch (o) {
        // Long options
@@ -2389,45 +2112,18 @@ main(int argc, char **argv) {
       case 'd':
         display = optarg;
         break;
-      case 'D':
-        fade_delta = atoi(optarg);
-        if (fade_delta < 1) {
-          fade_delta = 10;
-        }
-        break;
-      case 'I':
-        fade_in_step = atof(optarg);
-        if (fade_in_step <= 0) {
-          fade_in_step = 0.01;
-        }
-        break;
-      case 'O':
-        fade_out_step = atof(optarg);
-        if (fade_out_step <= 0) {
-          fade_out_step = 0.01;
-        }
-        break;
       case 'c':
         for (i = 1; i < NUM_WINTYPES; ++i) {
           win_type_shadow[i] = True;
         }
         win_type_shadow[WINTYPE_DESKTOP] = False;
         break;
-      case 'h': usage(argv[0], 0); break;
       case 'C':
         no_dock_shadow = True;
         break;
       case 'm':
         win_type_opacity[WINTYPE_DROPDOWN_MENU] = atof(optarg);
         win_type_opacity[WINTYPE_POPUP_MENU] = atof(optarg);
-        break;
-      case 'f':
-        for (i = 1; i < NUM_WINTYPES; ++i) {
-          win_type_fade[i] = True;
-        }
-        break;
-      case 'F':
-        fade_trans = True;
         break;
       case 'S':
         synchronize = True;
@@ -2453,11 +2149,10 @@ main(int argc, char **argv) {
       case 'n':
       case 'a':
       case 's':
-        fprintf(stderr, "Warning: "
-          "-n, -a, and -s have been removed.\n");
+        fprintf(stderr, "Warning: -n, -a, and -s have been removed.\n");
         break;
       default:
-        usage(argv[0], 1);
+        usage(argv[0], o != 'h');
         break;
     }
   }
@@ -2514,54 +2209,31 @@ main(int argc, char **argv) {
     exit(1);
 
   /* get atoms */
-  atom_opacity = XInternAtom(dpy,
-    "_NET_WM_WINDOW_OPACITY", False);
-  atom_win_type = XInternAtom(dpy,
-    "_NET_WM_WINDOW_TYPE", False);
-  atom_pixmap = XInternAtom(dpy,
-    "PIXMAP", False);
-  atom_wm_state = XInternAtom(dpy,
-    "WM_STATE", False);
-  atom_net_frame_extents = XInternAtom(dpy,
-    "_NET_FRAME_EXTENTS", False);
-  atom_gtk_frame_extents = XInternAtom(dpy,
-    "_GTK_FRAME_EXTENTS", False);
-  atom_net_wm_state = XInternAtom(dpy,
-    "_NET_WM_STATE", False);
-  atom_net_wm_state_hidden = XInternAtom (dpy,
-    "_NET_WM_STATE_HIDDEN", False);
-  atom_net_wm_state_focused = XInternAtom (dpy,
-    "_NET_WM_STATE_FOCUSED", False);
-  atom_net_active_window = XInternAtom (dpy,
-    "_NET_ACTIVE_WINDOW", False);
-  win_type[WINTYPE_DESKTOP] = XInternAtom(dpy,
-    "_NET_WM_WINDOW_TYPE_DESKTOP", False);
-  win_type[WINTYPE_DOCK] = XInternAtom(dpy,
-    "_NET_WM_WINDOW_TYPE_DOCK", False);
-  win_type[WINTYPE_TOOLBAR] = XInternAtom(dpy,
-    "_NET_WM_WINDOW_TYPE_TOOLBAR", False);
-  win_type[WINTYPE_MENU] = XInternAtom(dpy,
-    "_NET_WM_WINDOW_TYPE_MENU", False);
-  win_type[WINTYPE_UTILITY] = XInternAtom(dpy,
-    "_NET_WM_WINDOW_TYPE_UTILITY", False);
-  win_type[WINTYPE_SPLASH] = XInternAtom(dpy,
-    "_NET_WM_WINDOW_TYPE_SPLASH", False);
-  win_type[WINTYPE_DIALOG] = XInternAtom(dpy,
-    "_NET_WM_WINDOW_TYPE_DIALOG", False);
-  win_type[WINTYPE_NORMAL] = XInternAtom(dpy,
-    "_NET_WM_WINDOW_TYPE_NORMAL", False);
-  win_type[WINTYPE_DROPDOWN_MENU] = XInternAtom(dpy,
-    "_NET_WM_WINDOW_TYPE_DROPDOWN_MENU", False);
-  win_type[WINTYPE_POPUP_MENU] = XInternAtom(dpy,
-    "_NET_WM_WINDOW_TYPE_POPUP_MENU", False);
-  win_type[WINTYPE_TOOLTIP] = XInternAtom(dpy,
-    "_NET_WM_WINDOW_TYPE_TOOLTIP", False);
-  win_type[WINTYPE_NOTIFY] = XInternAtom(dpy,
-    "_NET_WM_WINDOW_TYPE_NOTIFICATION", False);
-  win_type[WINTYPE_COMBO] = XInternAtom(dpy,
-    "_NET_WM_WINDOW_TYPE_COMBO", False);
-  win_type[WINTYPE_DND] = XInternAtom(dpy,
-    "_NET_WM_WINDOW_TYPE_DND", False);
+  atom_opacity                    = XInternAtom(dpy, "_NET_WM_WINDOW_OPACITY", False);
+  atom_win_type                   = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE", False);
+  atom_pixmap                     = XInternAtom(dpy, "PIXMAP", False);
+  atom_wm_state                   = XInternAtom(dpy, "WM_STATE", False);
+  atom_net_frame_extents          = XInternAtom(dpy, "_NET_FRAME_EXTENTS", False);
+  atom_gtk_frame_extents          = XInternAtom(dpy, "_GTK_FRAME_EXTENTS", False);
+  atom_net_wm_state               = XInternAtom(dpy, "_NET_WM_STATE", False);
+  atom_net_wm_state_hidden        = XInternAtom (dpy, "_NET_WM_STATE_HIDDEN", False);
+  atom_net_wm_state_focused       = XInternAtom (dpy, "_NET_WM_STATE_FOCUSED", False);
+  atom_net_active_window          = XInternAtom (dpy, "_NET_ACTIVE_WINDOW", False);
+
+  win_type[WINTYPE_DESKTOP]       = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_DESKTOP", False);
+  win_type[WINTYPE_DOCK]          = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_DOCK", False);
+  win_type[WINTYPE_TOOLBAR]       = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_TOOLBAR", False);
+  win_type[WINTYPE_MENU]          = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_MENU", False);
+  win_type[WINTYPE_UTILITY]       = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_UTILITY", False);
+  win_type[WINTYPE_SPLASH]        = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_SPLASH", False);
+  win_type[WINTYPE_DIALOG]        = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_DIALOG", False);
+  win_type[WINTYPE_NORMAL]        = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_NORMAL", False);
+  win_type[WINTYPE_DROPDOWN_MENU] = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_DROPDOWN_MENU", False);
+  win_type[WINTYPE_POPUP_MENU]    = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_POPUP_MENU", False);
+  win_type[WINTYPE_TOOLTIP]       = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_TOOLTIP", False);
+  win_type[WINTYPE_NOTIFY]        = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_NOTIFICATION", False);
+  win_type[WINTYPE_COMBO]         = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_COMBO", False);
+  win_type[WINTYPE_DND]           = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_DND", False);
 
   gaussian_map = make_gaussian_map(dpy, shadow_radius);
   presum_gaussian(gaussian_map);
@@ -2586,8 +2258,7 @@ main(int argc, char **argv) {
   clip_changed = True;
   XGrabServer(dpy);
 
-  XCompositeRedirectSubwindows(
-    dpy, root, CompositeRedirectManual);
+  XCompositeRedirectSubwindows(dpy, root, CompositeRedirectManual);
 
   XSelectInput(dpy, root,
     SubstructureNotifyMask
@@ -2595,23 +2266,17 @@ main(int argc, char **argv) {
     | StructureNotifyMask
     | PropertyChangeMask);
 
-  XQueryTree(dpy, root, &root_return,
-    &parent_return, &children, &nchildren);
+  XQueryTree(dpy, root, &root_return, &parent_return, &children, &nchildren);
 
   for (i = 0; i < nchildren; i++) {
     add_win(dpy, children[i], i ? children[i-1] : None);
   }
 
   XFree(children);
-
   XUngrabServer(dpy);
 
-  ufd.fd = ConnectionNumber(dpy);
-  ufd.events = POLLIN;
-
   {
-    XRectangle root_rect = { .x=0, .y=0,
-                             .width=root_width , .height=root_height };
+    XRectangle root_rect = { .x=0, .y=0, .width=root_width, .height=root_height };
     XFixesSetRegion(dpy, g_xregion_tmp, &root_rect, 1);
     paint_all(dpy, g_xregion_tmp);
   }
@@ -2619,16 +2284,6 @@ main(int argc, char **argv) {
   for (;;) {
     /*    dump_wins(); */
     do {
-      if (!QLength(dpy)) {
-        // TODO: check and re-implement fade time logic.
-        int timeout = (configure_timer_started) ? 2 : fade_timeout();
-        if (unlikely(poll(&ufd, 1, timeout) == 0)) {
-          check_paint(dpy);
-           //   run_fades(dpy);
-          break;
-        }
-      }
-
       XNextEvent(dpy, &ev);
 
       if (likely((ev.type & 0x7f) != KeymapNotify)) {
@@ -2679,13 +2334,13 @@ main(int argc, char **argv) {
           handle_ConfigureNotify(dpy, &ev.xconfigure);
           break;
         case DestroyNotify:
-          destroy_win(dpy, ev.xdestroywindow.window, True);
+          destroy_win(dpy, ev.xdestroywindow.window);
           break;
         case MapNotify:
-          map_win(dpy, ev.xmap.window, ev.xmap.serial, True);
+          map_win(dpy, ev.xmap.window, ev.xmap.serial);
           break;
         case UnmapNotify:
-          unmap_win(dpy, ev.xunmap.window, True);
+          unmap_win(dpy, ev.xunmap.window);
           break;
         case ReparentNotify:
           // Reparent for instance occurs, when the window manager restarts. In the
@@ -2703,7 +2358,7 @@ main(int argc, char **argv) {
           } else {
             add_damage_if_hidden_changed(ev.xreparent.window, true);
             // FIXME: we only manage toplevel windows, so does this EVER fire?
-            destroy_win(dpy, ev.xreparent.window, True);
+            destroy_win(dpy, ev.xreparent.window);
           }
           break;
         case CirculateNotify:
@@ -2763,7 +2418,7 @@ main(int argc, char **argv) {
           break;
         case SelectionClear:
           fprintf(stderr, "Another composite manager started and took the _NET_WM_CM_Sn "
-	          "selection. Bye.\n");
+                          "selection. Bye.\n");
           exit(0);
           break;
         default:
